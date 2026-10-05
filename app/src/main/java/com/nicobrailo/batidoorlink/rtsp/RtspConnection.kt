@@ -7,7 +7,9 @@ import java.io.Closeable
 import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 
 /**
@@ -35,8 +37,13 @@ class RtspConnection(
     /** Set once SETUP has returned one; sent with every later request. */
     var session: String? = null
 
-    /** Called on the reader thread for each interleaved packet (RTCP from the server, usually). */
+    /** Called on the reader thread for each interleaved packet: media over TCP, or the server's RTCP. */
     var onInterleaved: ((RtspMessage.Interleaved) -> Unit)? = null
+
+    /** The last keepalive that failed, if any; the session is probably gone then. */
+    @Volatile var keepAliveFailure: Exception? = null
+        private set
+    private var keepAlive: ScheduledExecutorService? = null
 
     init {
         socket.connect(InetSocketAddress(host, port), connectTimeoutMs)
@@ -100,7 +107,35 @@ class RtspConnection(
         }
     }
 
+    /**
+     * Servers drop a session they hear nothing from for its timeout (65s on
+     * the Reolink with old firmware, 30s with new), and RTP doesn't count for
+     * all of them, so this asks something at under half of it. GET_PARAMETER
+     * is the usual ping; a server that doesn't know it gets OPTIONS instead.
+     */
+    fun startKeepAlive(url: String, sessionTimeoutSecs: Int) {
+        val period = (sessionTimeoutSecs / 2).coerceIn(5, 30).toLong()
+        var method = "GET_PARAMETER"
+        keepAlive = Executors.newSingleThreadScheduledExecutor { Thread(it, "rtsp-keepalive").apply { isDaemon = true } }
+            .apply {
+                scheduleWithFixedDelay({
+                    try {
+                        val r = request(method, url, expectOk = method == "OPTIONS")
+                        if (r.status != 200) {
+                            Log.i(TAG, "$method answered ${r.status}, pinging with OPTIONS")
+                            method = "OPTIONS"
+                            request(method, url)
+                        }
+                    } catch (e: IOException) {
+                        Log.w(TAG, "keepalive failed: $e")
+                        keepAliveFailure = e
+                    }
+                }, period, period, TimeUnit.SECONDS)
+            }
+    }
+
     override fun close() {
+        keepAlive?.shutdownNow()
         closed = true
         try {
             socket.close()
@@ -110,5 +145,9 @@ class RtspConnection(
 
     companion object {
         private const val TAG = "RtspConnection"
+
+        /** The timeout in a Session header ("DC7CB932;timeout=65"), or RFC 2326's default of 60s. */
+        fun sessionTimeout(sessionHeader: String): Int =
+            Regex("timeout=(\\d+)").find(sessionHeader)?.groupValues?.get(1)?.toInt() ?: 60
     }
 }

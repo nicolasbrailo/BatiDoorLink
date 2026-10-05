@@ -12,45 +12,40 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import android.view.MotionEvent
+import android.view.Surface
+import android.view.SurfaceHolder
+import android.view.SurfaceView
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.EditText
 import android.widget.TextView
-import androidx.annotation.OptIn
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
-import androidx.media3.common.AudioAttributes
-import androidx.media3.common.C
-import androidx.media3.common.MediaItem
-import androidx.media3.common.PlaybackException
-import androidx.media3.common.Player
-import androidx.media3.common.util.UnstableApi
-import androidx.media3.exoplayer.DefaultLoadControl
-import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.exoplayer.analytics.AnalyticsListener
-import androidx.media3.exoplayer.rtsp.RtspMediaSource
-import androidx.media3.ui.PlayerView
 import com.google.android.material.switchmaterial.SwitchMaterial
 import com.nicobrailo.batidoorlink.audio.MicStreamer
+import com.nicobrailo.batidoorlink.media.AccessUnit
+import com.nicobrailo.batidoorlink.media.AudioPlayer
+import com.nicobrailo.batidoorlink.media.VideoDecoder
 import com.nicobrailo.batidoorlink.rtsp.Backchannel
+import com.nicobrailo.batidoorlink.rtsp.StreamSession
 import java.util.concurrent.Executors
 
 /**
- * A test bench for talking to a doorbell: plays its RTSP stream with Media3
- * and sends the microphone back over the ONVIF backchannel, with switches for
- * everything that matters to echo (half or full duplex, the audio mode, the
- * mic source and the platform's voice effects).
+ * A test bench for talking to a doorbell: plays its RTSP stream through a
+ * pipeline of our own built for latency ([StreamSession], [VideoDecoder],
+ * [AudioPlayer]) and sends the microphone back over the ONVIF backchannel,
+ * with switches for everything that matters to echo (half or full duplex,
+ * the audio mode, the mic source and the platform's voice effects).
  *
  * The stream comes from the fields, or from an rtsp:// VIEW intent, which
  * fills them and connects: `adb shell am start -a android.intent.action.VIEW
  * -d rtsp://admin:@10.10.30.11/h264Preview_01_sub`.
  */
-@OptIn(UnstableApi::class)
-class MainActivity : AppCompatActivity() {
+class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
     private lateinit var prefs: SharedPreferences
     private lateinit var audioManager: AudioManager
-    private lateinit var playerView: PlayerView
+    private lateinit var videoFrame: VideoFrame
     private lateinit var status: TextView
     private lateinit var host: EditText
     private lateinit var stream: EditText
@@ -62,7 +57,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var halfDuplex: SwitchMaterial
     private lateinit var muteDoorbell: SwitchMaterial
     private lateinit var sendMic: SwitchMaterial
-    private lateinit var rtpTcp: SwitchMaterial
+    private lateinit var useTcp: SwitchMaterial
     private lateinit var talkOnConnect: SwitchMaterial
     private lateinit var commMode: SwitchMaterial
     private lateinit var voiceSource: SwitchMaterial
@@ -72,8 +67,9 @@ class MainActivity : AppCompatActivity() {
     private val main = Handler(Looper.getMainLooper())
     /** Opens and closes backchannels, which block on the network. One thread keeps them in order. */
     private val io = Executors.newSingleThreadExecutor { Thread(it, "talk-io") }
+    /** The same for the stream, apart, so the talk channel doesn't wait out a UDP attempt. */
+    private val streamIo = Executors.newSingleThreadExecutor { Thread(it, "stream-io") }
 
-    private var player: ExoPlayer? = null
     /**
      * Connected is what the user (or an intent) asked for, which outlives the
      * screen: leaving it disconnects, and coming back connects again. That is
@@ -81,29 +77,35 @@ class MainActivity : AppCompatActivity() {
      * the activity as soon as it starts.
      */
     private var wantConnected = false
+    private var connected = false
+    private var surface: Surface? = null
     private var url: String? = null
-    /** Bumped on every connect and disconnect, so a backchannel that opens late knows it is stale. */
+    /** Bumped on every connect and disconnect, so whatever opens late knows it is stale. */
     private var generation = 0
+    @Volatile private var session: StreamSession? = null
+    @Volatile private var videoDecoder: VideoDecoder? = null
+    @Volatile private var audioPlayer: AudioPlayer? = null
+    private var streamState = "idle"
     private var backchannel: Backchannel? = null
     private var talkState = "closed"
     private var mic: MicStreamer? = null
     /** Talking was asked for while the backchannel was still opening. */
     private var talkPending = false
     private var savedAudioMode: Int? = null
-    private var playerState = "idle"
-    private var playerError: String? = null
-    private var decoderName: String? = null
-    private var droppedFrames = 0
     /** Read on the mic's thread for every frame, so it takes effect at once. */
     @Volatile private var sendingMic = true
     private var refreshes = 0
+    private var lastFrames = 0L
+    private var lastFramesAt = 0L
+    private var fps = 0.0
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
         prefs = getSharedPreferences("settings", MODE_PRIVATE)
         audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
-        playerView = findViewById(R.id.player)
+        videoFrame = findViewById(R.id.video_frame)
+        findViewById<SurfaceView>(R.id.video).holder.addCallback(this)
         status = findViewById(R.id.status)
         host = findViewById(R.id.host)
         stream = findViewById(R.id.stream)
@@ -115,7 +117,7 @@ class MainActivity : AppCompatActivity() {
         halfDuplex = findViewById(R.id.half_duplex)
         muteDoorbell = findViewById(R.id.mute_doorbell)
         sendMic = findViewById(R.id.send_mic)
-        rtpTcp = findViewById(R.id.rtp_tcp)
+        useTcp = findViewById(R.id.use_tcp)
         talkOnConnect = findViewById(R.id.talk_on_connect)
         commMode = findViewById(R.id.comm_mode)
         voiceSource = findViewById(R.id.voice_source)
@@ -124,7 +126,7 @@ class MainActivity : AppCompatActivity() {
 
         loadFields()
         connectButton.setOnClickListener {
-            wantConnected = player == null
+            wantConnected = !connected
             if (wantConnected) connect() else disconnect()
         }
         setUpTalkControls()
@@ -147,7 +149,7 @@ class MainActivity : AppCompatActivity() {
     override fun onStart() {
         super.onStart()
         main.post(refreshStatus)
-        if (wantConnected && player == null) connect()
+        if (wantConnected && !connected) connect()
     }
 
     override fun onStop() {
@@ -160,6 +162,22 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         super.onDestroy()
         io.shutdown()
+        streamIo.shutdown()
+    }
+
+    override fun surfaceCreated(holder: SurfaceHolder) {
+        surface = holder.surface
+        if (wantConnected && !connected && lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.STARTED)) {
+            connect()
+        }
+    }
+
+    override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) = Unit
+
+    override fun surfaceDestroyed(holder: SurfaceHolder) {
+        // The decoder draws on this surface, so it has to stop before the surface goes.
+        disconnect()
+        surface = null
     }
 
     /** An rtsp:// URL fills the fields (credentials included) and connects, now or once on screen. */
@@ -183,7 +201,8 @@ class MainActivity : AppCompatActivity() {
         stream.setText(prefs.getString("stream", "h264Preview_01_sub"))
         user.setText(prefs.getString("user", "admin"))
         password.setText(prefs.getString("password", ""))
-        rtpTcp.isChecked = prefs.getBoolean("rtp_tcp", true)
+        // TCP by default: UDP was no faster here, slower to start, and froze on Wi-Fi losses (AGENTS.md).
+        useTcp.isChecked = prefs.getBoolean("use_tcp", true)
         talkOnConnect.isChecked = prefs.getBoolean("talk_on_connect", true)
         commMode.isChecked = prefs.getBoolean("comm_mode", true)
         voiceSource.isChecked = prefs.getBoolean("voice_source", true)
@@ -200,7 +219,7 @@ class MainActivity : AppCompatActivity() {
             .putString("stream", stream.text.toString().trim())
             .putString("user", user.text.toString())
             .putString("password", password.text.toString())
-            .putBoolean("rtp_tcp", rtpTcp.isChecked)
+            .putBoolean("use_tcp", useTcp.isChecked)
             .putBoolean("talk_on_connect", talkOnConnect.isChecked)
             .putBoolean("comm_mode", commMode.isChecked)
             .putBoolean("voice_source", voiceSource.isChecked)
@@ -211,7 +230,7 @@ class MainActivity : AppCompatActivity() {
             .apply()
     }
 
-    /** The stream's URL with the credentials in it, which is how both Media3 and [Backchannel] take them. */
+    /** The stream's URL with the credentials in it, which is how both sessions take them. */
     private fun buildUrl(): String? {
         val s = stream.text.toString().trim()
         val credentials = Uri.encode(user.text.toString()) + ":" + Uri.encode(password.text.toString()) + "@"
@@ -227,15 +246,15 @@ class MainActivity : AppCompatActivity() {
 
     private fun connect() {
         val u = buildUrl() ?: run {
-            playerError = "enter the camera's IP"
+            streamState = "enter the camera's IP"
             return
         }
+        // The decoder needs somewhere to draw; surfaceCreated connects once there is.
+        val target = surface ?: return
         saveFields()
         url = u
         generation++
-        playerError = null
-        decoderName = null
-        droppedFrames = 0
+        connected = true
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
         if (commMode.isChecked) {
@@ -245,64 +264,63 @@ class MainActivity : AppCompatActivity() {
             @Suppress("DEPRECATION")
             audioManager.isSpeakerphoneOn = true
         }
-
-        // A doorbell wants the picture now, not smooth: start playing on the
-        // first 100ms and keep little in hand. Even so, Media3 was measured
-        // holding about 1.6s and playing 2 to 2.7s behind the door (see
-        // AGENTS.md); the defaults weren't measured.
-        val loadControl = DefaultLoadControl.Builder()
-            .setBufferDurationsMs(500, 2000, 100, 200)
-            .build()
-        val p = ExoPlayer.Builder(this).setLoadControl(loadControl).build()
-        val attributes = if (commMode.isChecked) {
-            AudioAttributes.Builder().setUsage(C.USAGE_VOICE_COMMUNICATION)
-                .setContentType(C.AUDIO_CONTENT_TYPE_SPEECH).build()
-        } else {
-            AudioAttributes.Builder().setUsage(C.USAGE_MEDIA).setContentType(C.AUDIO_CONTENT_TYPE_MOVIE).build()
-        }
-        p.setAudioAttributes(attributes, false)
-        p.addListener(object : Player.Listener {
-            override fun onPlaybackStateChanged(state: Int) {
-                playerState = when (state) {
-                    Player.STATE_BUFFERING -> "buffering"
-                    Player.STATE_READY -> "playing"
-                    Player.STATE_ENDED -> "ended"
-                    else -> "idle"
-                }
-            }
-
-            override fun onPlayerError(error: PlaybackException) {
-                Log.w(TAG, "playback failed", error)
-                playerError = "${error.errorCodeName}: ${error.cause?.message ?: error.message}"
-            }
-        })
-        p.addAnalyticsListener(object : AnalyticsListener {
-            override fun onVideoDecoderInitialized(
-                eventTime: AnalyticsListener.EventTime, decoderName: String,
-                initializedTimestampMs: Long, initializationDurationMs: Long,
-            ) {
-                this@MainActivity.decoderName = decoderName
-            }
-
-            override fun onDroppedVideoFrames(eventTime: AnalyticsListener.EventTime, droppedFrames: Int,
-                                              elapsedMs: Long) {
-                this@MainActivity.droppedFrames += droppedFrames
-            }
-        })
-        p.setMediaSource(RtspMediaSource.Factory()
-            .setForceUseRtpTcp(rtpTcp.isChecked)
-            .setTimeoutMs(5000)
-            .createMediaSource(MediaItem.fromUri(u)))
-        playerView.player = p
-        p.playWhenReady = true
-        p.prepare()
-        player = p
-        applyVolume()
+        startStream(u, target, generation)
 
         connectButton.text = "Disconnect"
         holdToTalk.isEnabled = true
         openMic.isEnabled = true
         if (talkOnConnect.isChecked) openBackchannel()
+    }
+
+    private fun startStream(u: String, target: Surface, gen: Int) {
+        streamState = "connecting"
+        val tcp = useTcp.isChecked
+        val voice = commMode.isChecked
+        streamIo.execute {
+            if (gen != generation) return@execute
+            try {
+                val s = StreamSession.describe(u)
+                session = s
+                // The decoders exist before PLAY, since the camera starts with a keyframe.
+                val size = s.videoSize
+                if (s.hasVideo) {
+                    videoDecoder = VideoDecoder(target, s.parameterSets, size?.width ?: 1920, size?.height ?: 1080) { w, h ->
+                        main.post { videoFrame.setVideoSize(w, h) }
+                    }
+                    size?.let { main.post { videoFrame.setVideoSize(it.width, it.height) } }
+                }
+                s.audioConfig?.let { audioPlayer = AudioPlayer(it, voice) }
+                main.post { applyVolume() }
+                s.play(object : StreamSession.Listener {
+                    override fun onVideo(unit: AccessUnit) {
+                        videoDecoder?.offer(unit)
+                    }
+
+                    override fun onAudio(frame: ByteArray, rtpTimestamp: Long) {
+                        audioPlayer?.offer(frame)
+                    }
+                }, preferTcp = tcp)
+                main.post { if (gen == generation) streamState = "playing over ${s.transport}" }
+            } catch (e: Exception) {
+                Log.w(TAG, "stream failed", e)
+                main.post { if (gen == generation) streamState = "failed: ${e.message}" }
+            }
+        }
+    }
+
+    private fun stopStream() {
+        // In this order: nothing more arrives, then the decoders go. The video
+        // decoder goes here and now, while its surface still exists.
+        val s = session
+        session = null
+        val v = videoDecoder
+        videoDecoder = null
+        val a = audioPlayer
+        audioPlayer = null
+        v?.release()
+        a?.release()
+        streamIo.execute { s?.close() }
+        streamState = "idle"
     }
 
     private fun disconnect() {
@@ -311,10 +329,8 @@ class MainActivity : AppCompatActivity() {
         talkPending = false
         openMic.isChecked = false
         closeBackchannel()
-        player?.release()
-        player = null
-        playerView.player = null
-        playerState = "idle"
+        stopStream()
+        connected = false
         savedAudioMode?.let {
             audioManager.mode = it
             @Suppress("DEPRECATION")
@@ -385,7 +401,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startTalking() {
-        if (player == null) return
+        if (!connected) return
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
             != PackageManager.PERMISSION_GRANTED) {
             ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.RECORD_AUDIO), 1)
@@ -425,36 +441,48 @@ class MainActivity : AppCompatActivity() {
 
     private fun applyVolume() {
         val silent = muteDoorbell.isChecked || (halfDuplex.isChecked && mic != null)
-        player?.volume = if (silent) 0f else 1f
+        audioPlayer?.setVolume(if (silent) 0f else 1f)
     }
 
     private val refreshStatus = object : Runnable {
         override fun run() {
-            player?.let {
-                // Every 2s, for following a test from adb.
-                if (++refreshes % 4 == 0) {
-                    Log.d(TAG, "position ${it.currentPosition}ms at ${android.os.SystemClock.elapsedRealtime()}, " +
-                        "buffered ${it.totalBufferedDuration}ms, " +
-                        "state $playerState, talk $talkState" + (mic?.let { m -> ", mic %.0f dBFS".format(m.levelDb) } ?: ""))
-                }
+            val now = android.os.SystemClock.elapsedRealtime()
+            videoDecoder?.let {
+                val frames = it.framesRendered
+                if (lastFramesAt > 0) fps = (frames - lastFrames) * 1000.0 / (now - lastFramesAt).coerceAtLeast(1)
+                lastFrames = frames
+            } ?: run {
+                lastFrames = 0
+                fps = 0.0
             }
+            lastFramesAt = now
+            // Every 2s, for following a test from adb.
+            if (connected && ++refreshes % 4 == 0) Log.d(TAG, statusText().replace("\n", " | "))
             status.text = statusText()
             main.postDelayed(this, 500)
         }
     }
 
     private fun statusText(): String {
-        val p = player ?: return playerError ?: "not connected"
-        val lines = mutableListOf<String>()
-        val video = p.videoFormat
-        lines += "video: " + (video?.let {
-            "${it.width}x${it.height} ${it.codecs ?: it.sampleMimeType} " +
-                (if (it.frameRate > 0) "%.0ffps ".format(it.frameRate) else "") + (decoderName ?: "")
-        } ?: "none yet")
-        lines += "audio: " + (p.audioFormat?.let { "${it.sampleMimeType} ${it.sampleRate}Hz" } ?: "none yet") +
-            if (p.volume == 0f) " (muted)" else ""
-        lines += "state: $playerState, buffered ${p.totalBufferedDuration}ms, dropped $droppedFrames"
-        playerError?.let { lines += "error: $it" }
+        if (!connected) return if (streamState == "idle") "not connected" else streamState
+        val lines = mutableListOf("stream: $streamState")
+        val s = session
+        val v = videoDecoder
+        if (v != null) {
+            lines += "video: ${s?.videoSize?.let { "${it.width}x${it.height} " } ?: ""}${v.decoderName}, " +
+                "%.0f fps, decode %.0fms".format(fps, v.decodeLatencyMs)
+            lines += "video loss: ${s?.videoPacketsLost ?: 0} packets, ${s?.videoUnitsDropped ?: 0} pictures dropped, " +
+                "${v.framesSkipped} skipped"
+            v.failure?.let { lines += "video error: $it" }
+        }
+        val a = audioPlayer
+        if (a != null) {
+            lines += "audio: AAC ${s?.audioConfig?.sampleRate ?: 0}Hz, queued ${a.queuedMs}ms, " +
+                "dropped ${a.droppedMs}ms, lost ${s?.audioPacketsLost ?: 0} packets" +
+                if (muteDoorbell.isChecked || (halfDuplex.isChecked && mic != null)) " (muted)" else ""
+            a.failure?.let { lines += "audio error: $it" }
+        }
+        s?.failure?.let { lines += "stream failing: ${it.message}" }
         val bc = backchannel
         lines += "talk: $talkState" + (bc?.let { ", ${it.packetsSent.get()} packets sent" } ?: "") +
             (bc?.failure?.let { ", failing: ${it.message}" } ?: "")

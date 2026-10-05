@@ -18,6 +18,20 @@ class SdpTest {
     }
 
     @Test
+    fun readsFormatsAndClockRates() {
+        val video = Sdp.parse(resource("reolink-6460.sdp"))[0]
+        assertEquals(96, video.payloadTypeFor("h264"))
+        assertEquals(90000, video.clockRates[96])
+        assertEquals("1", video.formats[96]?.get("packetization-mode"))
+        // Base64 padding survives splitting on '='.
+        assertEquals("Z2QAM6wVFKCgPZA=,aO48sA==", video.formats[96]?.get("sprop-parameter-sets"))
+        val audio = Sdp.parse(resource("reolink-6460.sdp"))[1]
+        assertEquals(16000, audio.clockRates[97])
+        assertEquals("1408", audio.formats[97]?.get("config"))
+        assertEquals("13", audio.formats[97]?.get("sizelength"))
+    }
+
+    @Test
     fun findsThePcmuBackchannelOfCurrentFirmware() {
         assertEquals(BackchannelTrack("track3", G711.PCMU),
             Sdp.backchannel(Sdp.parse(resource("reolink-6460.sdp"))))

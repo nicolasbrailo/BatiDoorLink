@@ -6,10 +6,18 @@ data class MediaSection(
     val payloadTypes: List<Int>,
     /** Payload type to encoding name, from `a=rtpmap` ("PCMU" from "PCMU/8000"). */
     val encodings: Map<Int, String>,
+    /** Payload type to RTP clock rate, from `a=rtpmap` (8000 from "PCMU/8000"). */
+    val clockRates: Map<Int, Int> = emptyMap(),
+    /** Payload type to its `a=fmtp` parameters, keys in lower case. */
+    val formats: Map<Int, Map<String, String>> = emptyMap(),
     val control: String?,
     /** sendonly, recvonly, sendrecv or inactive, as the server wrote it, or null. */
     val direction: String?,
-)
+) {
+    /** The first payload type this section offers in [encoding] (case insensitive), if any. */
+    fun payloadTypeFor(encoding: String): Int? =
+        payloadTypes.firstOrNull { encodings[it].equals(encoding, ignoreCase = true) }
+}
 
 /** The backchannel a server offers: where to SETUP it and what to send. */
 data class BackchannelTrack(val control: String, val codec: G711)
@@ -22,11 +30,16 @@ object Sdp {
         var media: String? = null
         var payloadTypes = emptyList<Int>()
         var encodings = mutableMapOf<Int, String>()
+        var clockRates = mutableMapOf<Int, Int>()
+        var formats = mutableMapOf<Int, Map<String, String>>()
         var control: String? = null
         var direction: String? = null
 
         fun flush() {
-            media?.let { sections += MediaSection(it, payloadTypes, encodings, control, direction) }
+            media?.let {
+                sections += MediaSection(it, payloadTypes, encodings, clockRates = clockRates, formats = formats,
+                    control = control, direction = direction)
+            }
         }
 
         for (raw in sdp.lineSequence()) {
@@ -39,6 +52,8 @@ object Sdp {
                     media = parts.getOrNull(0) ?: ""
                     payloadTypes = parts.drop(3).mapNotNull { it.toIntOrNull() }
                     encodings = mutableMapOf()
+                    clockRates = mutableMapOf()
+                    formats = mutableMapOf()
                     control = null
                     direction = null
                 }
@@ -47,7 +62,17 @@ object Sdp {
                     // a=rtpmap:0 PCMU/8000
                     val rest = line.substring("a=rtpmap:".length)
                     val pt = rest.substringBefore(' ').toIntOrNull() ?: continue
-                    encodings[pt] = rest.substringAfter(' ').substringBefore('/').trim()
+                    val encoding = rest.substringAfter(' ').trim()
+                    encodings[pt] = encoding.substringBefore('/')
+                    encoding.split('/').getOrNull(1)?.toIntOrNull()?.let { clockRates[pt] = it }
+                }
+                line.startsWith("a=fmtp:") -> {
+                    // a=fmtp:96 packetization-mode=1;profile-level-id=640033;sprop-parameter-sets=...
+                    val rest = line.substring("a=fmtp:".length)
+                    val pt = rest.substringBefore(' ').toIntOrNull() ?: continue
+                    formats[pt] = rest.substringAfter(' ').split(';')
+                        .map { it.trim() }.filter { '=' in it }
+                        .associate { it.substringBefore('=').trim().lowercase() to it.substringAfter('=').trim() }
                 }
                 line.startsWith("a=control:") -> control = line.substring("a=control:".length).trim()
                 line.startsWith("a=") && line.substring(2) in DIRECTIONS -> direction = line.substring(2)

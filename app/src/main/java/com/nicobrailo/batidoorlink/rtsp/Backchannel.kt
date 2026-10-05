@@ -4,9 +4,6 @@ import android.util.Log
 import java.io.Closeable
 import java.io.IOException
 import java.net.URI
-import java.util.concurrent.Executors
-import java.util.concurrent.ScheduledFuture
-import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 
 /**
@@ -26,33 +23,9 @@ class Backchannel private constructor(
     val sessionTimeoutSecs: Int,
 ) : Closeable {
     private val packetizer = RtpPacketizer(codec.payloadType)
-    private val keepAlive = Executors.newSingleThreadScheduledExecutor { Thread(it, "rtsp-keepalive").apply { isDaemon = true } }
-    private var keepAliveTask: ScheduledFuture<*>? = null
-    @Volatile var failure: Exception? = null
-        private set
+    @Volatile private var sendFailure: Exception? = null
+    val failure: Exception? get() = sendFailure ?: connection.keepAliveFailure
     val packetsSent = AtomicLong()
-
-    private fun startKeepAlive() {
-        // Servers drop a session they hear nothing from for its timeout (65s on
-        // Reolink), and RTP doesn't count for all of them, so ask something at
-        // under half of it.
-        // GET_PARAMETER is the usual ping; a server that doesn't know it gets OPTIONS instead.
-        val period = (sessionTimeoutSecs / 2).coerceIn(5, 30).toLong()
-        var method = "GET_PARAMETER"
-        keepAliveTask = keepAlive.scheduleWithFixedDelay({
-            try {
-                val r = connection.request(method, aggregateUrl, expectOk = method == "OPTIONS")
-                if (r.status != 200) {
-                    Log.i(TAG, "$method answered ${r.status}, pinging with OPTIONS")
-                    method = "OPTIONS"
-                    connection.request(method, aggregateUrl)
-                }
-            } catch (e: IOException) {
-                Log.w(TAG, "keepalive failed: $e")
-                failure = e
-            }
-        }, period, period, TimeUnit.SECONDS)
-    }
 
     /** Sends [length] bytes of G.711 (one byte a sample, 8 kHz) as one RTP packet. */
     fun send(payload: ByteArray, length: Int) {
@@ -60,7 +33,7 @@ class Backchannel private constructor(
             connection.sendInterleaved(CHANNEL, packetizer.packet(payload, length))
             packetsSent.incrementAndGet()
         } catch (e: IOException) {
-            failure = e
+            sendFailure = e
             throw e
         }
     }
@@ -69,8 +42,6 @@ class Backchannel private constructor(
     fun markTalkspurt() = packetizer.markNextTalkspurt()
 
     override fun close() {
-        keepAliveTask?.cancel(false)
-        keepAlive.shutdownNow()
         try {
             connection.request("TEARDOWN", aggregateUrl, timeoutMs = 2000)
         } catch (e: IOException) {
@@ -104,9 +75,10 @@ class Backchannel private constructor(
                     require + ("Transport" to "RTP/AVP/TCP;unicast;interleaved=$CHANNEL-${CHANNEL + 1}"))
                 val sessionHeader = setup.header("session") ?: throw IOException("SETUP returned no session")
                 connection.session = sessionHeader.substringBefore(';').trim()
-                val timeout = Regex("timeout=(\\d+)").find(sessionHeader)?.groupValues?.get(1)?.toInt() ?: 60
+                val timeout = RtspConnection.sessionTimeout(sessionHeader)
                 connection.request("PLAY", base, require + ("Range" to "npt=0.000-"))
-                return Backchannel(connection, base, track.codec, timeout).also { it.startKeepAlive() }
+                connection.startKeepAlive(base, timeout)
+                return Backchannel(connection, base, track.codec, timeout)
             } catch (e: Exception) {
                 connection.close()
                 throw e

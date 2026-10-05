@@ -1,0 +1,25 @@
+v=0
+o=- 1791226200179920 1 IN IP4 192.168.0.3
+s=Session streamed by "preview"
+i=reolink rtsp stream
+t=0 0
+a=tool:Reolink Streaming Media 2024.12.11
+a=type:broadcast
+a=control:*
+a=range:npt=now-
+a=x-qt-text-nam:Session streamed by "preview"
+m=video 0 RTP/AVP 96
+c=IN IP4 0.0.0.0
+b=AS:8192
+a=rtpmap:96 H264/90000
+a=range:npt=now-
+a=fmtp:96 packetization-mode=1;profile-level-id=640033;sprop-parameter-sets=Z2QAM6wVFKAoAPGQ,aO48sA==
+a=recvonly
+a=control:track1
+m=audio 0 RTP/AVP 97
+c=IN IP4 0.0.0.0
+b=AS:8192
+a=rtpmap:97 MPEG4-GENERIC/16000
+a=fmtp:97 streamtype=5;profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;config=1408
+a=recvonly
+a=control:track2
