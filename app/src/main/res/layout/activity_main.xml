@@ -1,0 +1,175 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#000000"
+    android:orientation="horizontal">
+
+    <FrameLayout
+        android:layout_width="0dp"
+        android:layout_height="match_parent"
+        android:layout_weight="1">
+
+        <androidx.media3.ui.PlayerView
+            android:id="@+id/player"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            app:resize_mode="fit"
+            app:show_buffering="when_playing"
+            app:use_controller="false" />
+
+        <TextView
+            android:id="@+id/status"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="bottom|start"
+            android:layout_margin="8dp"
+            android:background="#99000000"
+            android:fontFamily="monospace"
+            android:padding="6dp"
+            android:textColor="#FFFFFF"
+            android:textSize="12sp" />
+    </FrameLayout>
+
+    <ScrollView
+        android:layout_width="340dp"
+        android:layout_height="match_parent"
+        android:background="?android:attr/colorBackground">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:padding="12dp">
+
+            <EditText
+                android:id="@+id/host"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:hint="Camera IP (host or host:port)"
+                android:importantForAutofill="no"
+                android:inputType="textUri" />
+
+            <EditText
+                android:id="@+id/stream"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:hint="Stream path, or a full rtsp:// URL"
+                android:importantForAutofill="no"
+                android:inputType="textUri" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <EditText
+                    android:id="@+id/user"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:hint="User"
+                    android:importantForAutofill="no"
+                    android:inputType="text" />
+
+                <EditText
+                    android:id="@+id/password"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:hint="Password"
+                    android:importantForAutofill="no"
+                    android:inputType="textPassword" />
+            </LinearLayout>
+
+            <Button
+                android:id="@+id/connect"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Connect" />
+
+            <Button
+                android:id="@+id/hold_to_talk"
+                android:layout_width="match_parent"
+                android:layout_height="96dp"
+                android:enabled="false"
+                android:text="Hold to talk" />
+
+            <com.google.android.material.switchmaterial.SwitchMaterial
+                android:id="@+id/open_mic"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:enabled="false"
+                android:text="Open mic (full duplex)" />
+
+            <com.google.android.material.switchmaterial.SwitchMaterial
+                android:id="@+id/send_mic"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Send the mic to the doorbell (off: level meter only)" />
+
+            <com.google.android.material.switchmaterial.SwitchMaterial
+                android:id="@+id/half_duplex"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Mute the doorbell while talking" />
+
+            <com.google.android.material.switchmaterial.SwitchMaterial
+                android:id="@+id/mute_doorbell"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Mute the doorbell" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:text="Applied on the next connect"
+                android:textStyle="bold" />
+
+            <com.google.android.material.switchmaterial.SwitchMaterial
+                android:id="@+id/rtp_tcp"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Video over TCP" />
+
+            <com.google.android.material.switchmaterial.SwitchMaterial
+                android:id="@+id/talk_on_connect"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Open the talk channel on connect" />
+
+            <com.google.android.material.switchmaterial.SwitchMaterial
+                android:id="@+id/comm_mode"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Call audio mode (voice usage, in-communication)" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:text="Applied the next time the mic opens"
+                android:textStyle="bold" />
+
+            <com.google.android.material.switchmaterial.SwitchMaterial
+                android:id="@+id/voice_source"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Mic: voice communication source" />
+
+            <com.google.android.material.switchmaterial.SwitchMaterial
+                android:id="@+id/aec"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Echo canceller (if the device has one)" />
+
+            <com.google.android.material.switchmaterial.SwitchMaterial
+                android:id="@+id/ns"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Noise suppressor (if the device has one)" />
+        </LinearLayout>
+    </ScrollView>
+</LinearLayout>
