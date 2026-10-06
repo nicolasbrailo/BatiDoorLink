@@ -5,6 +5,8 @@ import android.annotation.SuppressLint
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.net.Uri
 import android.os.Bundle
@@ -15,9 +17,14 @@ import android.view.MotionEvent
 import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
+import android.view.View
 import android.view.WindowManager
+import android.widget.AdapterView
+import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
+import android.widget.ImageButton
+import android.widget.Spinner
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
@@ -40,19 +47,34 @@ import java.util.concurrent.Executors
  *
  * The stream comes from the fields, or from an rtsp:// VIEW intent, which
  * fills them and connects: `adb shell am start -a android.intent.action.VIEW
- * -d rtsp://admin:@10.10.30.11/h264Preview_01_sub`.
+ * -d rtsp://admin:@10.10.30.11/h264Preview_01_sub`. Opened by an intent (a
+ * doorbell ring, later), it shows only the video with the call's buttons
+ * (talk, hang up) and closes itself after [AUTO_CLOSE_MS] untouched; opened
+ * by hand, it shows the config panel too. The settings button over the video
+ * shows and hides the panel either way.
+ *
+ * It leaves other apps' audio alone while it only shows the door: the
+ * doorbell's sound plays over whatever else is playing, without asking for
+ * audio focus. Only talking takes focus (so music pauses) and, with "Call
+ * audio mode", switches the device to in-communication; both are given back
+ * when the talking stops.
  */
 class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
     private lateinit var prefs: SharedPreferences
     private lateinit var audioManager: AudioManager
     private lateinit var videoFrame: VideoFrame
+    private lateinit var videoView: SurfaceView
     private lateinit var status: TextView
     private lateinit var host: EditText
     private lateinit var stream: EditText
     private lateinit var user: EditText
     private lateinit var password: EditText
     private lateinit var connectButton: Button
-    private lateinit var holdToTalk: Button
+    private lateinit var talkButton: ImageButton
+    private lateinit var hangUpButton: ImageButton
+    private lateinit var callButtons: View
+    private lateinit var panel: View
+    private lateinit var historySpinner: Spinner
     private lateinit var openMic: SwitchMaterial
     private lateinit var halfDuplex: SwitchMaterial
     private lateinit var muteDoorbell: SwitchMaterial
@@ -92,6 +114,17 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
     /** Talking was asked for while the backchannel was still opening. */
     private var talkPending = false
     private var savedAudioMode: Int? = null
+    private var focusRequest: AudioFocusRequest? = null
+    /** Opened by an intent (a ring) rather than by hand: hanging up closes it. */
+    private var openedByRing = false
+    private var history = emptyList<String>()
+    /** Opened by an intent rather than by the user, so it closes itself when left alone. */
+    private var autoClose = false
+    private var autoCloseAt = 0L
+    private val closeUnattended = Runnable {
+        Log.i(TAG, "closing: untouched for ${AUTO_CLOSE_MS / 1000}s")
+        finish()
+    }
     /** Read on the mic's thread for every frame, so it takes effect at once. */
     @Volatile private var sendingMic = true
     private var refreshes = 0
@@ -105,14 +138,19 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
         prefs = getSharedPreferences("settings", MODE_PRIVATE)
         audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
         videoFrame = findViewById(R.id.video_frame)
-        findViewById<SurfaceView>(R.id.video).holder.addCallback(this)
+        videoView = findViewById(R.id.video)
+        videoView.holder.addCallback(this)
         status = findViewById(R.id.status)
         host = findViewById(R.id.host)
         stream = findViewById(R.id.stream)
         user = findViewById(R.id.user)
         password = findViewById(R.id.password)
         connectButton = findViewById(R.id.connect)
-        holdToTalk = findViewById(R.id.hold_to_talk)
+        talkButton = findViewById(R.id.talk)
+        hangUpButton = findViewById(R.id.hang_up)
+        callButtons = findViewById(R.id.call_buttons)
+        panel = findViewById(R.id.panel)
+        historySpinner = findViewById(R.id.history)
         openMic = findViewById(R.id.open_mic)
         halfDuplex = findViewById(R.id.half_duplex)
         muteDoorbell = findViewById(R.id.mute_doorbell)
@@ -126,10 +164,21 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
 
         loadFields()
         connectButton.setOnClickListener {
-            wantConnected = !connected
-            if (wantConnected) connect() else disconnect()
+            // Whoever connects by hand is using the app, not glancing at a ring.
+            stopAutoClose()
+            reconnect()
         }
+        hangUpButton.setOnClickListener { hangUp() }
+        findViewById<View>(R.id.toggle_panel).setOnClickListener {
+            val show = panel.visibility != View.VISIBLE
+            // Opening the settings is somebody using the app, as connecting by hand is.
+            if (show) stopAutoClose()
+            showPanel(show)
+        }
+        setUpHistory()
         setUpTalkControls()
+        showPanel(true)
+        callButtons.visibility = View.GONE
         muteDoorbell.setOnCheckedChangeListener { _, _ -> applyVolume() }
         halfDuplex.setOnCheckedChangeListener { _, _ -> applyVolume() }
         sendMic.setOnCheckedChangeListener { _, checked -> sendingMic = checked }
@@ -150,6 +199,10 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
         super.onStart()
         main.post(refreshStatus)
         if (wantConnected && !connected) connect()
+        // Counted from when it can be seen: an intent that arrives under the
+        // screensaver starts the activity and stops it again at once. The
+        // first picture starts it again; this is for a stream that never shows one.
+        resetAutoClose()
     }
 
     override fun onStop() {
@@ -157,6 +210,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
         // A doorbell view nobody can see shouldn't keep the camera or the mic open.
         disconnect()
         main.removeCallbacks(refreshStatus)
+        main.removeCallbacks(closeUnattended)
     }
 
     override fun onDestroy() {
@@ -176,24 +230,122 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
         // The decoder draws on this surface, so it has to stop before the surface goes.
-        disconnect()
+        disconnect(waitForDecoders = true)
         surface = null
     }
 
     /** An rtsp:// URL fills the fields (credentials included) and connects, now or once on screen. */
     private fun handleIntent(intent: Intent?) {
+        if (intent?.action == Intent.ACTION_MAIN && openedByRing) {
+            // Opened from the launcher over a ring: somebody using the app now.
+            openedByRing = false
+            stopAutoClose()
+            showPanel(true)
+            return
+        }
         val data = intent?.data ?: return
         if (intent.action != Intent.ACTION_VIEW || !data.scheme.equals("rtsp", true)) return
+        fillFields(data)
+        disconnect()
+        wantConnected = true
+        autoClose = true
+        openedByRing = true
+        // A ring wants the door, not the settings.
+        showPanel(false)
+        if (lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.STARTED)) {
+            connect()
+            resetAutoClose()
+        }
+    }
+
+    /** The fields from an rtsp:// URL, credentials included. */
+    private fun fillFields(data: Uri) {
         host.setText(if (data.port > 0) "${data.host}:${data.port}" else data.host)
         stream.setText(data.encodedPath.orEmpty().trimStart('/') +
             (data.encodedQuery?.let { "?$it" } ?: ""))
+        user.setText("")
+        password.setText("")
         data.encodedUserInfo?.let { info ->
             user.setText(Uri.decode(info.substringBefore(':')))
             password.setText(if (':' in info) Uri.decode(info.substringAfter(':')) else "")
         }
+    }
+
+    /** The panel and the debug details go together: neither belongs on a ring. */
+    private fun showPanel(show: Boolean) {
+        panel.visibility = if (show) View.VISIBLE else View.GONE
+        status.visibility = panel.visibility
+    }
+
+    private fun reconnect() {
         disconnect()
         wantConnected = true
-        if (lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.STARTED)) connect()
+        connect()
+    }
+
+    /** As on a call: a ring goes away when hung up; opened by hand, the panel stays to pick another stream. */
+    private fun hangUp() {
+        wantConnected = false
+        disconnect()
+        if (openedByRing) {
+            finish()
+        } else {
+            showPanel(true)
+            // Otherwise the last picture stays, looking live. Hiding the view
+            // takes its surface away, and connect() brings it back.
+            videoView.visibility = View.INVISIBLE
+        }
+    }
+
+    private fun setUpHistory() {
+        history = StreamHistory.decode(prefs.getString("history", null))
+        refreshHistory()
+        historySpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                // The first entry is the title; anything else is a stream to go back to.
+                if (position == 0) return
+                val url = history.getOrNull(position - 1) ?: return
+                historySpinner.setSelection(0)
+                stopAutoClose()
+                fillFields(Uri.parse(url))
+                reconnect()
+            }
+
+            override fun onNothingSelected(parent: AdapterView<*>?) = Unit
+        }
+    }
+
+    private fun refreshHistory() {
+        val entries = listOf(if (history.isEmpty()) "No recent streams" else "Recent streams (${history.size})") +
+            history.map { StreamHistory.label(it) }
+        historySpinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, entries)
+        historySpinner.isEnabled = history.isNotEmpty()
+    }
+
+    /** Only streams that played go in the history, so a typo doesn't. */
+    private fun remember(url: String) {
+        history = StreamHistory.add(history, url)
+        prefs.edit().putString("history", StreamHistory.encode(history)).apply()
+        refreshHistory()
+    }
+
+    /** Any touch is somebody using it. */
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        if (ev.actionMasked == MotionEvent.ACTION_DOWN) resetAutoClose()
+        return super.dispatchTouchEvent(ev)
+    }
+
+    /** Starts the countdown again, unless somebody is talking, which holds it off altogether. */
+    private fun resetAutoClose() {
+        main.removeCallbacks(closeUnattended)
+        if (!autoClose || mic != null || talkPending) return
+        autoCloseAt = android.os.SystemClock.uptimeMillis() + AUTO_CLOSE_MS
+        main.postAtTime(closeUnattended, autoCloseAt)
+    }
+
+    private fun stopAutoClose() {
+        autoClose = false
+        main.removeCallbacks(closeUnattended)
     }
 
     private fun loadFields() {
@@ -250,57 +402,68 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
             return
         }
         // The decoder needs somewhere to draw; surfaceCreated connects once there is.
-        val target = surface ?: return
+        val target = surface ?: run {
+            videoView.visibility = View.VISIBLE
+            return
+        }
         saveFields()
         url = u
         generation++
         connected = true
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
-        if (commMode.isChecked) {
-            savedAudioMode = audioManager.mode
-            audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
-            // The Portal has no earpiece, but a call routes to one by default elsewhere.
-            @Suppress("DEPRECATION")
-            audioManager.isSpeakerphoneOn = true
-        }
         startStream(u, target, generation)
 
-        connectButton.text = "Disconnect"
-        holdToTalk.isEnabled = true
+        connectButton.text = "Reconnect"
+        callButtons.visibility = View.VISIBLE
         openMic.isEnabled = true
-        if (talkOnConnect.isChecked) openBackchannel()
     }
 
     private fun startStream(u: String, target: Surface, gen: Int) {
         streamState = "connecting"
         val tcp = useTcp.isChecked
         val voice = commMode.isChecked
+        Log.i(TAG, "timing: connect")
         streamIo.execute {
             if (gen != generation) return@execute
             try {
                 val s = StreamSession.describe(u)
+                Log.i(TAG, "timing: described")
                 session = s
-                // The decoders exist before PLAY, since the camera starts with a keyframe.
+                // The decoders exist before PLAY: the first thing the camera
+                // sends is a keyframe, and missing it costs a keyframe interval.
                 val size = s.videoSize
-                if (s.hasVideo) {
-                    videoDecoder = VideoDecoder(target, s.parameterSets, size?.width ?: 1920, size?.height ?: 1080) { w, h ->
-                        main.post { videoFrame.setVideoSize(w, h) }
-                    }
+                val v = if (s.hasVideo) {
                     size?.let { main.post { videoFrame.setVideoSize(it.width, it.height) } }
-                }
-                s.audioConfig?.let { audioPlayer = AudioPlayer(it, voice) }
+                    VideoDecoder(target, s.parameterSets, size?.width ?: 1920, size?.height ?: 1080,
+                        onSize = { w, h -> main.post { videoFrame.setVideoSize(w, h) } },
+                        // The 30s are 30s of the door: the picture comes up to 5s after
+                        // the activity (the camera's keyframe), so the count starts again then.
+                        onFirstPicture = { main.post { if (gen == generation) resetAutoClose() } })
+                } else null
+                val a = s.audioConfig?.let { AudioPlayer(it, voice) }
+                videoDecoder = v
+                audioPlayer = a
                 main.post { applyVolume() }
+                // The listener keeps its own decoders: a session still closing
+                // must not feed the next one's.
                 s.play(object : StreamSession.Listener {
                     override fun onVideo(unit: AccessUnit) {
-                        videoDecoder?.offer(unit)
+                        v?.offer(unit)
                     }
 
                     override fun onAudio(frame: ByteArray, rtpTimestamp: Long) {
-                        audioPlayer?.offer(frame)
+                        a?.offer(frame)
                     }
                 }, preferTcp = tcp)
-                main.post { if (gen == generation) streamState = "playing over ${s.transport}" }
+                Log.i(TAG, "timing: playing")
+                main.post {
+                    if (gen != generation) return@post
+                    streamState = "playing over ${s.transport}"
+                    remember(u)
+                    // After the stream, so its requests don't queue behind these at the camera.
+                    if (talkOnConnect.isChecked) openBackchannel()
+                }
             } catch (e: Exception) {
                 Log.w(TAG, "stream failed", e)
                 main.post { if (gen == generation) streamState = "failed: ${e.message}" }
@@ -308,38 +471,47 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
         }
     }
 
-    private fun stopStream() {
-        // In this order: nothing more arrives, then the decoders go. The video
-        // decoder goes here and now, while its surface still exists.
+    /**
+     * Stopping a decoder takes a few hundred ms, which on the main thread
+     * held up the next connect, so it happens on [streamIo], ahead of
+     * anything the next connect queues there; that also keeps one decoder
+     * on the surface at a time. Only when the surface itself is going does
+     * this wait for it. The session closes on a thread of its own, since its
+     * TEARDOWN can take seconds to time out.
+     */
+    private fun stopStream(waitForDecoders: Boolean) {
         val s = session
         session = null
         val v = videoDecoder
         videoDecoder = null
         val a = audioPlayer
         audioPlayer = null
-        v?.release()
-        a?.release()
-        streamIo.execute { s?.close() }
+        s?.let { Thread({ it.close() }, "stream-close").start() }
+        val released = streamIo.submit {
+            v?.release()
+            a?.release()
+        }
+        if (waitForDecoders) {
+            try {
+                released.get(3, java.util.concurrent.TimeUnit.SECONDS)
+            } catch (e: Exception) {
+                Log.w(TAG, "decoders slow to stop: $e")
+            }
+        }
         streamState = "idle"
     }
 
-    private fun disconnect() {
+    private fun disconnect(waitForDecoders: Boolean = false) {
         generation++
         stopMic()
         talkPending = false
         openMic.isChecked = false
         closeBackchannel()
-        stopStream()
+        stopStream(waitForDecoders)
         connected = false
-        savedAudioMode?.let {
-            audioManager.mode = it
-            @Suppress("DEPRECATION")
-            audioManager.isSpeakerphoneOn = false
-        }
-        savedAudioMode = null
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         connectButton.text = "Connect"
-        holdToTalk.isEnabled = false
+        callButtons.visibility = View.GONE
         openMic.isEnabled = false
     }
 
@@ -382,7 +554,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
 
     @SuppressLint("ClickableViewAccessibility")
     private fun setUpTalkControls() {
-        holdToTalk.setOnTouchListener { v, e ->
+        talkButton.setOnTouchListener { v, e ->
             when (e.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
                     v.isPressed = true
@@ -407,6 +579,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
             ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.RECORD_AUDIO), 1)
             return
         }
+        main.removeCallbacks(closeUnattended)
         if (backchannel == null) {
             talkPending = true
             openBackchannel()
@@ -418,6 +591,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
     private fun stopTalking() {
         talkPending = false
         stopMic()
+        resetAutoClose()
     }
 
     private fun startMic() {
@@ -426,7 +600,9 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
         if (mic != null) return
         val options = MicStreamer.Options(voiceSource.isChecked, aec.isChecked, ns.isChecked)
         saveFields()
+        takeAudioForTalking()
         bc.markTalkspurt()
+        talkButton.isActivated = true
         mic = MicStreamer(bc.codec, options) { frame, length ->
             if (sendingMic) bc.send(frame, length)
         }.also { it.start() }
@@ -434,9 +610,49 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
     }
 
     private fun stopMic() {
+        val wasTalking = mic != null
         mic?.stop()
         mic = null
+        talkButton.isActivated = false
+        giveAudioBack()
         applyVolume()
+        if (wasTalking) resetAutoClose()
+    }
+
+    /**
+     * Transient focus makes music pause, and resume when it's given back.
+     * The in-communication mode is what a platform echo canceller works in;
+     * it is set only while talking because switching to it is slow (part of
+     * the startup delay this used to cause) and other apps notice it.
+     */
+    private fun takeAudioForTalking() {
+        val attributes = AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+            .build()
+        focusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+            .setAudioAttributes(attributes)
+            .setOnAudioFocusChangeListener { Log.i(TAG, "audio focus changed: $it") }
+            .build()
+            .also { audioManager.requestAudioFocus(it) }
+        if (commMode.isChecked) {
+            savedAudioMode = audioManager.mode
+            audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+            // The Portal has no earpiece, but a call routes to one by default elsewhere.
+            @Suppress("DEPRECATION")
+            audioManager.isSpeakerphoneOn = true
+        }
+    }
+
+    private fun giveAudioBack() {
+        savedAudioMode?.let {
+            audioManager.mode = it
+            @Suppress("DEPRECATION")
+            audioManager.isSpeakerphoneOn = false
+        }
+        savedAudioMode = null
+        focusRequest?.let { audioManager.abandonAudioFocusRequest(it) }
+        focusRequest = null
     }
 
     private fun applyVolume() {
@@ -489,7 +705,11 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
         mic?.let {
             lines += "mic: ${it.description}, %.0f dBFS".format(it.levelDb) + if (sendingMic) "" else " (not sent)"
         }
-        lines += "audio mode: " + when (audioManager.mode) {
+        if (autoClose && connected) {
+            val left = (autoCloseAt - android.os.SystemClock.uptimeMillis()) / 1000
+            lines += if (mic != null || talkPending) "stays open while talking" else "closes in ${left.coerceAtLeast(0)}s unless touched"
+        }
+        lines += "audio focus: " + (if (focusRequest != null) "held (talking)" else "not taken") + ", mode: " + when (audioManager.mode) {
             AudioManager.MODE_IN_COMMUNICATION -> "in communication"
             AudioManager.MODE_NORMAL -> "normal"
             else -> audioManager.mode.toString()
@@ -499,5 +719,6 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
 
     companion object {
         private const val TAG = "BatiDoorLink"
+        const val AUTO_CLOSE_MS = 30_000L
     }
 }

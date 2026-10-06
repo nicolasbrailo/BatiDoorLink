@@ -26,9 +26,11 @@ import kotlin.random.Random
  *
  * It is opened in two steps so nothing is lost at the start: [describe] says
  * what the stream holds, which the decoders need before they can start, and
- * [play] sets the tracks up and starts them. The Reolink sends a keyframe
- * first thing after PLAY, so whoever isn't listening by then waits for the
- * next one (2 to 4s).
+ * [play] sets the tracks up and starts them. The Reolink sends nothing
+ * after PLAY until its next keyframe (measured over TCP: 0.6 to 3s on the
+ * sub stream, which has one every 4s, 0.2 to 1.3s on the main, every 2s),
+ * so the first packet is a keyframe, and a decoder that misses it waits a
+ * whole interval for the next.
  */
 class StreamSession private constructor(
     private val url: RtspUrl,

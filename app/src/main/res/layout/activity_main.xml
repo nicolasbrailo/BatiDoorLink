@@ -1,4 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- The video with the call's buttons over it (talk, hang up, settings), and
+     the config panel beside it, which the settings button shows and hides.
+     Opened by a ring, only the video and the buttons show. -->
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
@@ -21,20 +24,65 @@
                 android:layout_height="match_parent" />
         </com.nicobrailo.batidoorlink.VideoFrame>
 
+        <!-- Debug details: shown with the config panel only -->
         <TextView
             android:id="@+id/status"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_gravity="bottom|start"
+            android:layout_gravity="top|start"
             android:layout_margin="8dp"
             android:background="#99000000"
             android:fontFamily="monospace"
             android:padding="6dp"
             android:textColor="#FFFFFF"
             android:textSize="12sp" />
+
+        <ImageButton
+            android:id="@+id/toggle_panel"
+            android:layout_width="56dp"
+            android:layout_height="56dp"
+            android:layout_gravity="top|end"
+            android:layout_margin="16dp"
+            android:background="@drawable/overlay_button_background"
+            android:contentDescription="Settings"
+            android:padding="14dp"
+            android:scaleType="fitCenter"
+            android:src="@drawable/ic_settings" />
+
+        <!-- As AstroDock's call screen: big round buttons at the bottom -->
+        <LinearLayout
+            android:id="@+id/call_buttons"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="bottom|center_horizontal"
+            android:layout_marginBottom="32dp"
+            android:orientation="horizontal">
+
+            <ImageButton
+                android:id="@+id/talk"
+                android:layout_width="88dp"
+                android:layout_height="88dp"
+                android:layout_marginEnd="96dp"
+                android:background="@drawable/talk_background"
+                android:contentDescription="Hold to talk"
+                android:padding="22dp"
+                android:scaleType="fitCenter"
+                android:src="@drawable/ic_mic" />
+
+            <ImageButton
+                android:id="@+id/hang_up"
+                android:layout_width="88dp"
+                android:layout_height="88dp"
+                android:background="@drawable/hang_up_background"
+                android:contentDescription="Hang up"
+                android:padding="20dp"
+                android:scaleType="fitCenter"
+                android:src="@drawable/ic_call_end" />
+        </LinearLayout>
     </FrameLayout>
 
     <ScrollView
+        android:id="@+id/panel"
         android:layout_width="340dp"
         android:layout_height="match_parent"
         android:background="?android:attr/colorBackground">
@@ -44,6 +92,12 @@
             android:layout_height="wrap_content"
             android:orientation="vertical"
             android:padding="12dp">
+
+            <Spinner
+                android:id="@+id/history"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:minHeight="48dp" />
 
             <EditText
                 android:id="@+id/host"
@@ -90,13 +144,6 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:text="Connect" />
-
-            <Button
-                android:id="@+id/hold_to_talk"
-                android:layout_width="match_parent"
-                android:layout_height="96dp"
-                android:enabled="false"
-                android:text="Hold to talk" />
 
             <com.google.android.material.switchmaterial.SwitchMaterial
                 android:id="@+id/open_mic"
@@ -146,7 +193,7 @@
                 android:id="@+id/comm_mode"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:text="Call audio mode (voice usage, in-communication)" />
+                android:text="Call audio mode (voice usage; in-communication while talking)" />
 
             <TextView
                 android:layout_width="match_parent"

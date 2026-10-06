@@ -20,6 +20,8 @@ class VideoDecoder(
     private val height: Int,
     /** The decoded picture's size, once known, on the decoder's thread. */
     private val onSize: (Int, Int) -> Unit,
+    /** The first picture went to the screen, on the decoder's thread. */
+    private val onFirstPicture: () -> Unit = {},
 ) {
     private val queue = LinkedBlockingDeque<AccessUnit>()
     @Volatile private var running = true
@@ -83,6 +85,7 @@ class VideoDecoder(
             format.setInteger("vendor.qti-ext-dec-low-latency.enable", 1)
             codec.configure(format, surface, null, 0)
             codec.start()
+            Log.i(TAG, "timing: decoder started")
             loop(codec)
         } catch (e: Exception) {
             Log.w(TAG, "decoder failed", e)
@@ -108,7 +111,10 @@ class VideoDecoder(
                     val buffer = codec.getInputBuffer(index)!!
                     buffer.clear()
                     buffer.put(unit.data)
-                    if (firstTimestamp < 0) firstTimestamp = unit.rtpTimestamp
+                    if (firstTimestamp < 0) {
+                        firstTimestamp = unit.rtpTimestamp
+                        Log.i(TAG, "timing: first picture into the decoder")
+                    }
                     // 90 kHz RTP clock, which wraps at 32 bits.
                     val ptsUs = ((unit.rtpTimestamp - firstTimestamp) and 0xFFFFFFFFL) * 1000 / 90
                     synchronized(arrivals) {
@@ -124,6 +130,10 @@ class VideoDecoder(
                 when {
                     out >= 0 -> {
                         codec.releaseOutputBuffer(out, true)
+                        if (framesRendered == 0L) {
+                            Log.i(TAG, "timing: first picture on screen")
+                            onFirstPicture()
+                        }
                         framesRendered++
                         val arrived = synchronized(arrivals) { arrivals.remove(info.presentationTimeUs) }
                         if (arrived != null) {

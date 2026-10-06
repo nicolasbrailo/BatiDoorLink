@@ -1,13 +1,13 @@
 # BatiDoorLink
 
 Android app for talking to a doorbell camera over RTSP: it plays the camera's
-stream and sends the microphone back over the ONVIF audio backchannel. For now
-it is a test bench for two-way (duplex) audio, with the camera typed in by
-hand. It is meant to become the viewer that
-[AstroDock](../AstroDock) starts when the doorbell rings, through an
-`ACTION_VIEW` intent with the stream's `rtsp://` URL; AstroDock will own the
-camera settings, the MQTT ring event and waking the screen, and this app will
-own nothing but the call.
+stream and sends the microphone back over the ONVIF audio backchannel. It is a test
+bench for two-way (duplex) audio, with the camera typed in by hand, and the
+viewer that [AstroDock](../AstroDock) starts when the doorbell rings, through
+an `ACTION_VIEW` intent with the stream's `rtsp://` URL (AstroDock's
+`doorbell/DoorbellViewer.kt`). AstroDock owns the MQTT ring event
+(`cmd/doorbell/ring`, sent by zmw_homeboard, which gets the camera's streams
+from zmw_doorman) and waking the screen; this app owns nothing but the call.
 
 It runs on Facebook Portals (Android 9 and 10, arm64, no Google Play
 Services), like AstroDock; `../AstroDock/AGENTS.md` has the platform notes.
@@ -22,6 +22,13 @@ Keep it up to date when the design changes.
   `/usr/lib/jvm` have no `javac`, so Gradle needs Android Studio's:
   `J=~/src/android-studio/jbr; JAVA_HOME=$J ./gradlew -Porg.gradle.java.installations.paths=$J ...`
 - `adb install -r app/build/outputs/apk/debug/app-debug.apk`
+- `tools/build-apks.sh [OUT_DIR]`: runs the unit tests, builds both APKs and
+  leaves them in `~/Downloads` as `BatiDoorLink-debug.apk` and
+  `BatiDoorLink-release.apk`, printing each one's version, size and sha256 and
+  the key that signed them (the Android debug keystore, as AstroDock's; it has
+  to stay the same for updates to install). It finds a JDK with `javac` by
+  itself (Android Studio's, failing `JAVA_HOME`), so it runs from a plain
+  shell. Prefer the debug APK: `run-as` needs it.
 - Connect from adb, filling the fields:
   `adb shell am start -a android.intent.action.VIEW -d 'rtsp://admin:@10.10.30.11/h264Preview_01_sub'`
 - `adb shell pm grant com.nicobrailo.batidoorlink android.permission.RECORD_AUDIO`
@@ -92,13 +99,59 @@ A Reolink Video Doorbell PoE (hardware `DB_566128M5MP_P`), measured
 
 All sources are in `app/src/main/java/com/nicobrailo/batidoorlink/`.
 
-- `MainActivity.kt` + `res/layout/activity_main.xml`: the fields (host,
-  stream path or full URL, user, password), Connect, the talk controls and
-  the switches, with a status overlay on the video refreshed every 500ms
-  (video format and decoder, buffer, dropped frames, talk channel, packets
-  sent, mic level, audio mode). A VIEW intent fills the fields and connects.
+- `MainActivity.kt` + `res/layout/activity_main.xml`: the video, with the
+  call's buttons over it as on AstroDock's call screen (its
+  `hang_up_background` and `ic_call_end`): Talk (hold; green while it
+  sends, `res/drawable/talk_background.xml`) and Hang up at the bottom,
+  shown while connected, and a settings button at the top right that
+  shows and hides the config panel beside the video. The debug overlay
+  (format and decoder, frame rate, decode time, losses, audio queue, talk
+  channel, packets sent, mic level, focus, countdown) shows with the panel
+  only. The panel: a dropdown of recent streams, the fields (host, stream
+  path or full URL, user, password), Connect (Reconnect while connected)
+  and the switches.
+  **Opened by a ring** (a VIEW intent): video and buttons only, the panel
+  hidden; hanging up closes the app, like ending a call. **Opened by hand**
+  (the launcher): the panel shows; hanging up disconnects, blanks the video
+  (the last picture would otherwise stay, looking live: hiding the
+  SurfaceView takes its surface, and `connect()` brings it back) and shows
+  the panel. The launcher over a ring switches to the second.
+  `StreamHistory.kt`: the recent streams, most recent first, 10 at most,
+  each the full URL with its credentials (it is what reconnecting needs; the
+  dropdown shows it without them), in the `history` preference, one per
+  line. A stream goes in once it plays, so a typo doesn't; picking one
+  fills the fields and connects. Pure and unit tested.
   Leaving the screen (`onStop`) disconnects everything.
-  Talking is either held (Hold to talk) or left on (Open mic, full duplex).
+  Opened by an intent (as a ring will open it), it closes itself
+  (`finish()`, back to AstroDock) after 30s nobody touched it, counted from
+  the first picture on screen (the count from the activity starting, which
+  left only 25 to 29s of picture behind the camera's keyframe wait, is the
+  fallback for a stream that never shows one). Any touch restarts the 30s, talking (held or open
+  mic) holds it off, and letting go restarts it. Connecting or
+  disconnecting by hand turns it off: that is somebody using the app. Opened
+  from the launcher it never closes itself. The status line shows the
+  countdown. Measured on the Portal+: closed 30.0s after the talk button
+  was let go.
+  **Other apps' audio:** while it only shows the door it asks for no audio
+  focus and leaves the audio mode alone, so music carries on and the
+  doorbell plays over it. Talking (held or open mic) takes transient focus,
+  which pauses music, and with "Call audio mode" switches to
+  `MODE_IN_COMMUNICATION`; both are given back when the talking stops, and
+  music resumes. Measured with Spotify holding focus: untouched while
+  watching, `LOSS_TRANSIENT` while the button was held, focus back after.
+  Earlier versions switched the mode on connect, which also cost startup
+  time.
+  **Connecting**, measured on the Portal+ (2026-10-06, `timing:` lines in
+  the log): a cold start takes 1.2s to get to connecting (process start
+  and layout), an already open app 0.04s; DESCRIBE, SETUP and PLAY take 0.3
+  to 0.4s; and then the camera sends nothing until its next keyframe, 0 to
+  4s on the sub stream, 0 to 2s on the main. That wait is most of it, and
+  only the camera's keyframe interval can shorten it. Stopping the old
+  decoders happens on `streamIo` and closing the old session on a thread of
+  its own, since on the main thread they held a reconnect up by 0.7s. The
+  talk channel opens once the stream plays, so its requests don't queue
+  ahead of the stream's at the camera.
+  Talking is either held (the Talk button) or left on (Open mic, full duplex).
   "Mute the doorbell while talking" makes it half duplex.
   The talk channel opens on connect, so pressing the button is instant (a
   switch makes it wait for the first press). "Call audio mode" plays the
